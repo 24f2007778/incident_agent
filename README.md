@@ -29,3 +29,5 @@ Note: a local SQLite file on an ephemeral hosting filesystem may not survive res
 The application writes request, planner, persistence, replay, and receipt lifecycle events to the standard application log. In Render, open the service's **Logs** view and filter by `run_id`. Planner failures include a reason such as `provider_http_error`, `provider_timeout`, `provider_transport_error`, or `unexpected_planning_error`; upstream HTTP status and elapsed time are included when available.
 
 Logs intentionally exclude request bodies, transcripts, tool arguments/results, and API keys. Do not enable HTTPX wire/debug logging in production because it may expose request headers or payloads.
+
+Planner requests are capped at 256 KiB. Transcripts are sent in full when they fit; larger transcripts are reduced to whole evidence records ranked against incident details, allowed root causes, and tool descriptions. The planner log records request size and, when reduction occurs, original/retained transcript bytes and record counts. A provider HTTP 413 means its request-body limit was exceeded; check these sizes when diagnosing it.
