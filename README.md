@@ -1,18 +1,18 @@
 # Incident Response Agent
 
 ## Files
-- `incident_agent.py`: FastAPI application
-- `requirements_incident.txt`: Python dependencies
+- `main.py`: FastAPI application (`main:app`)
+- `requirements.txt`: Python dependencies
 
 ## Render deployment
 Build command:
 ```bash
-pip install -r requirements_incident.txt
+pip install -r requirements.txt
 ```
 
 Start command:
 ```bash
-uvicorn incident_agent:app --host 0.0.0.0 --port $PORT
+uvicorn main:app --host 0.0.0.0 --port $PORT
 ```
 
 ## Environment variables
@@ -23,3 +23,9 @@ Set the variables required by the application in your hosting provider's environ
 - `DATABASE_PATH`: path to a durable database file if supported by your deployment
 
 Note: a local SQLite file on an ephemeral hosting filesystem may not survive restarts or redeploys. Verify the app against the full assignment contract before using a limited Check/Save attempt.
+
+## Debugging deployment errors
+
+The application writes request, planner, persistence, replay, and receipt lifecycle events to the standard application log. In Render, open the service's **Logs** view and filter by `run_id`. Planner failures include a reason such as `provider_http_error`, `provider_timeout`, `provider_transport_error`, or `unexpected_planning_error`; upstream HTTP status and elapsed time are included when available.
+
+Logs intentionally exclude request bodies, transcripts, tool arguments/results, and API keys. Do not enable HTTPX wire/debug logging in production because it may expose request headers or payloads.

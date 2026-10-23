@@ -1,5 +1,5 @@
 from __future__ import annotations
-import asyncio, hashlib, json, os, re, secrets, sqlite3, time, uuid
+import asyncio, hashlib, json, logging, os, re, secrets, sqlite3, time, uuid
 from contextlib import contextmanager
 from typing import Any
 import httpx
@@ -14,6 +14,7 @@ MODEL=os.getenv('LLM_MODEL','openai/gpt-oss-20b')
 BASE=os.getenv('LLM_BASE_URL','https://api.groq.com/openai/v1').rstrip('/')
 KEY=os.getenv('LLM_API_KEY','')
 app=FastAPI(title='Incident Response Agent',version='2.0.0')
+logger=logging.getLogger(__name__)
 
 def canon(x): return json.dumps(x,sort_keys=True,separators=(',',':'),ensure_ascii=False,allow_nan=False)
 def sha(x): return hashlib.sha256(canon(x).encode()).hexdigest()
@@ -128,28 +129,55 @@ def health(): return {'name':'incident-response','status':'ok'}
 async def start(request:Request):
     try:
         raw=await request.body()
-        if len(raw)>MAX_BODY:return response({'error':'request body too large'},413)
+        if len(raw)>MAX_BODY:
+            logger.warning('incident request rejected reason=body_too_large size=%s',len(raw))
+            return response({'error':'request body too large'},413)
         b=json.loads(raw,parse_constant=lambda x: (_ for _ in ()).throw(ValueError('invalid JSON')))
         b=validate_start(b)
-    except Exception as e:return response({'error':'invalid request','detail':str(e)[:120]},400)
+    except Exception as e:
+        reason=e.msg if isinstance(e,json.JSONDecodeError) else str(e) if type(e) is ValueError else type(e).__name__
+        logger.warning('incident request rejected error_type=%s reason=%s',type(e).__name__,reason[:120])
+        return response({'error':'invalid request','detail':str(e)[:120]},400)
     run=b['runId']; rh=sha({k:v for k,v in b.items() if k!='sensitive'})
     with db() as c:
         row=c.execute('SELECT request_hash,state_json FROM runs WHERE run_id=?',(run,)).fetchone()
         if row:
-            if row['request_hash']!=rh:return response({'error':'runId reused with changed content'},409)
+            if row['request_hash']!=rh:
+                logger.warning('incident request conflict run_id=%s reason=changed_content',run)
+                return response({'error':'runId reused with changed content'},409)
+            logger.info('incident request replay run_id=%s',run)
             return response(public_state(json.loads(row['state_json'])))
-    # Planner gets no sensitive object. Start fresh trace context and create exactly one model span.
+    logger.info('incident planning started run_id=%s model=%s',run,MODEL)
+    planning_started=time.monotonic()
     try:
         decision=await asyncio.wait_for(plan(b,'','', ''),timeout=15)
         state=build_initial(b,decision)
+    except asyncio.TimeoutError:
+        logger.error('incident planning failed run_id=%s reason=deadline_timeout duration_ms=%d',run,int((time.monotonic()-planning_started)*1000))
+        return response({'error':'planning failed','detail':'planner timed out'},503)
+    except httpx.TimeoutException as e:
+        logger.error('incident planning failed run_id=%s reason=provider_timeout error_type=%s duration_ms=%d',run,type(e).__name__,int((time.monotonic()-planning_started)*1000))
+        return response({'error':'planning failed','detail':'planner request timed out'},503)
+    except httpx.HTTPStatusError as e:
+        logger.error('incident planning failed run_id=%s reason=provider_http_error upstream_status=%s duration_ms=%d',run,e.response.status_code,int((time.monotonic()-planning_started)*1000))
+        return response({'error':'planning failed','detail':f'planner returned HTTP {e.response.status_code}'},503)
+    except httpx.RequestError as e:
+        logger.error('incident planning failed run_id=%s reason=provider_transport_error error_type=%s duration_ms=%d',run,type(e).__name__,int((time.monotonic()-planning_started)*1000))
+        return response({'error':'planning failed','detail':'planner provider could not be reached'},503)
     except Exception as e:
-        return response({'error':'planning failed','detail':str(e)[:160]},503)
+        logger.error('incident planning failed run_id=%s reason=unexpected_planning_error error_type=%s duration_ms=%d',run,type(e).__name__,int((time.monotonic()-planning_started)*1000))
+        return response({'error':'planning failed','detail':'planner returned an invalid or unusable response'},503)
+    logger.info('incident planning succeeded run_id=%s diagnostic_count=%s duration_ms=%d',run,len(state['dispatches']),int((time.monotonic()-planning_started)*1000))
     with db() as c:
         row=c.execute('SELECT request_hash,state_json FROM runs WHERE run_id=?',(run,)).fetchone()
         if row:
-            if row['request_hash']!=rh:return response({'error':'runId reused with changed content'},409)
+            if row['request_hash']!=rh:
+                logger.warning('incident request conflict run_id=%s reason=changed_content',run)
+                return response({'error':'runId reused with changed content'},409)
+            logger.info('incident request replay after planning run_id=%s',run)
             return response(public_state(json.loads(row['state_json'])))
         c.execute('INSERT INTO runs(run_id,request_hash,state_json,created) VALUES(?,?,?,?)',(run,rh,canon(state),time.time()))
+    logger.info('incident state persisted run_id=%s status=%s',run,state['status'])
     return response(public_state(state))
 
 @app.get('/v2/incidents/{run_id}')
@@ -162,10 +190,15 @@ def get_run(run_id:str):
 async def receipt(run_id:str,request:Request):
     try:
         raw=await request.body()
-        if len(raw)>MAX_BODY:return response({'error':'request body too large'},413)
+        if len(raw)>MAX_BODY:
+            logger.warning('receipt rejected run_id=%s reason=body_too_large size=%s',run_id,len(raw))
+            return response({'error':'request body too large'},413)
         b=json.loads(raw)
         if not isinstance(b,dict) or set(b)-{'receiptId','outcomes','approvals'} or not isinstance(b.get('receiptId'),str) or not b['receiptId'] or not (isinstance(b.get('outcomes',[]),list) and isinstance(b.get('approvals',[]),list)): raise ValueError('invalid receipt envelope')
-    except Exception:return response({'error':'invalid receipt request'},400)
+    except Exception as e:
+        reason=e.msg if isinstance(e,json.JSONDecodeError) else str(e) if type(e) is ValueError else type(e).__name__
+        logger.warning('receipt rejected run_id=%s error_type=%s reason=%s',run_id,type(e).__name__,reason[:120])
+        return response({'error':'invalid receipt request'},400)
     rh=sha(b)
     with db() as c:
         row=c.execute('SELECT state_json FROM runs WHERE run_id=?',(run_id,)).fetchone()
@@ -173,22 +206,37 @@ async def receipt(run_id:str,request:Request):
         s=json.loads(row['state_json'])
         prior=c.execute('SELECT run_id,receipt_hash FROM receipt_ids WHERE receipt_id=?',(b['receiptId'],)).fetchone()
         if prior:
-            if prior['run_id']!=run_id or prior['receipt_hash']!=rh:return response({'error':'receiptId reused with changed content'},409)
+            if prior['run_id']!=run_id or prior['receipt_hash']!=rh:
+                logger.warning('receipt conflict run_id=%s reason=receipt_id_reused',run_id)
+                return response({'error':'receiptId reused with changed content'},409)
             # Exact receipt replay returns current stored state, without effects or model calls.
+            logger.info('receipt replay run_id=%s',run_id)
             return response(public_state(s))
-        if s['status']!='waiting':return response({'error':'run is not waiting'},409)
+        if s['status']!='waiting':
+            logger.warning('receipt rejected run_id=%s reason=run_not_waiting status=%s',run_id,s['status'])
+            return response({'error':'run is not waiting'},409)
         outcomes=b.get('outcomes',[]); approvals=b.get('approvals',[])
         # Reject unknown, duplicated, or non-pending outcomes atomically.
         seen=set()
         for o in outcomes:
-            if not isinstance(o,dict) or not all(k in o for k in ('actionId','callId','attempt','status','nonce')):return response({'error':'malformed outcome'},400)
+            if not isinstance(o,dict) or not all(k in o for k in ('actionId','callId','attempt','status','nonce')):
+                logger.warning('receipt rejected run_id=%s reason=malformed_outcome',run_id)
+                return response({'error':'malformed outcome'},400)
             key=o['callId']
-            if key in seen or key not in s['pending']:return response({'error':'outcome is not for a pending call'},409)
+            if key in seen or key not in s['pending']:
+                logger.warning('receipt rejected run_id=%s reason=outcome_not_pending',run_id)
+                return response({'error':'outcome is not for a pending call'},409)
             d=s['pending'][key]['dispatch']
-            if o['actionId']!=d['actionId'] or o['attempt']!=d['attempt']:return response({'error':'outcome mismatch'},409)
-            if not isinstance(o['status'],int) or not isinstance(o['nonce'],str) or not o['nonce']:return response({'error':'invalid outcome fields'},400)
+            if o['actionId']!=d['actionId'] or o['attempt']!=d['attempt']:
+                logger.warning('receipt rejected run_id=%s reason=outcome_mismatch',run_id)
+                return response({'error':'outcome mismatch'},409)
+            if not isinstance(o['status'],int) or not isinstance(o['nonce'],str) or not o['nonce']:
+                logger.warning('receipt rejected run_id=%s reason=invalid_outcome_fields',run_id)
+                return response({'error':'invalid outcome fields'},400)
             seen.add(key)
-        if not outcomes and not approvals:return response({'error':'empty receipt'},400)
+        if not outcomes and not approvals:
+            logger.warning('receipt rejected run_id=%s reason=empty_receipt',run_id)
+            return response({'error':'empty receipt'},400)
         c.execute('INSERT INTO receipt_ids(receipt_id,run_id,receipt_hash) VALUES(?,?,?)',(b['receiptId'],run_id,rh))
         # Process diagnostics. A 503 gets exactly one retry; timeout suppresses dependent effect.
         next_dispatch=[]; effect_completed=False
@@ -240,4 +288,5 @@ async def receipt(run_id:str,request:Request):
         if s['status'] in ('completed','failed'):
             s['dispatches']=[]; s['approvals']=[]; s['chosenEffectName']=s.get('chosenEffect',{}).get('toolName') if s['status']=='completed' else None
         save_state(c,run_id,s)
+        logger.info('receipt processed run_id=%s outcome_count=%s approval_count=%s status=%s dispatch_count=%s',run_id,len(outcomes),len(approvals),s['status'],len(s['dispatches']))
     return response(public_state(s))
