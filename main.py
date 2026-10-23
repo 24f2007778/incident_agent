@@ -81,7 +81,7 @@ def planner_payload(b,system,max_request_bytes=MAX_PLANNER_REQUEST_BYTES):
     full_payload={'model':MODEL,'temperature':0,'response_format':{'type':'json_object'},'messages':[{'role':'system','content':system},{'role':'user','content':canon(full_user)}]}
     full_size=len(canon(full_payload).encode('utf-8'))
     if full_size<=max_request_bytes:
-        return full_payload,full_size,False
+        return full_payload,full_size,False,max_request_bytes
 
     transcript=inc['transcript']
     keywords=set(re.findall(r'[a-z0-9]{3,}',canon({
@@ -101,9 +101,10 @@ def planner_payload(b,system,max_request_bytes=MAX_PLANNER_REQUEST_BYTES):
         tokens=re.findall(r'[a-z0-9]{3,}',record.lower())
         score=sum(1 for token in tokens if token in keywords)
         ranked.append((score,index,record))
-    if empty_size>max_request_bytes:
-        raise ValueError('planner metadata exceeds request size limit')
-    capacity=max_request_bytes-empty_size
+    effective_limit=max(max_request_bytes,empty_size+512)
+    if effective_limit>max_request_bytes:
+        logger.warning('planner metadata exceeds transcript budget run_id=%s metadata_bytes=%s configured_limit_bytes=%s effective_limit_bytes=%s',b['runId'],empty_size,max_request_bytes,effective_limit)
+    capacity=effective_limit-empty_size
     selected=[]; used=0
     for _,index,record in sorted(ranked,key=lambda item:(-item[0],item[1])):
         encoded_record=json.dumps(record,ensure_ascii=False,separators=(',',':'))[1:-1]
@@ -117,8 +118,8 @@ def planner_payload(b,system,max_request_bytes=MAX_PLANNER_REQUEST_BYTES):
     payload['messages'][1]['content']=canon(user)
     final={'model':MODEL,'temperature':0,'response_format':{'type':'json_object'},'messages':[{'role':'system','content':system},{'role':'user','content':canon(user)}]}
     final_size=len(canon(final).encode('utf-8'))
-    logger.info('planner transcript compacted run_id=%s original_bytes=%s retained_bytes=%s evidence_records=%s retained_records=%s request_bytes=%s request_limit_bytes=%s',b['runId'],len(transcript.encode('utf-8')),len(compact.encode('utf-8')),len(records),len(selected),final_size,max_request_bytes)
-    return final,final_size,True
+    logger.info('planner transcript compacted run_id=%s original_bytes=%s retained_bytes=%s evidence_records=%s retained_records=%s request_bytes=%s request_limit_bytes=%s effective_limit_bytes=%s',b['runId'],len(transcript.encode('utf-8')),len(compact.encode('utf-8')),len(records),len(selected),final_size,max_request_bytes,effective_limit)
+    return final,final_size,True,effective_limit
 
 async def plan(b,trace,server_id,agent_id):
     inc=b['incident']; catalog=b['toolCatalog']; policy=b['policy']
@@ -129,13 +130,15 @@ async def plan(b,trace,server_id,agent_id):
         request_limit=MAX_PLANNER_REQUEST_BYTES
         rate_limit_retries=0
         while True:
-            payload,estimated_bytes,compacted=planner_payload(b,system,request_limit)
+            payload,estimated_bytes,compacted,effective_limit=planner_payload(b,system,request_limit)
             async with planner_semaphore:
                 request=client.build_request('POST',BASE+'/chat/completions',headers={'Authorization':'Bearer '+KEY},json=payload)
                 request_bytes=len(request.content or b'')
                 logger.info('planner request run_id=%s model=%s request_bytes=%s estimated_bytes=%s transcript_bytes=%s compacted=%s request_limit_bytes=%s',b['runId'],MODEL,request_bytes,estimated_bytes,len(inc['transcript'].encode('utf-8')),compacted,request_limit)
                 r=await client.send(request)
-            if r.status_code==413 and request_limit>MIN_PLANNER_REQUEST_BYTES:
+            if r.status_code==413 and effective_limit>request_limit:
+                logger.error('planner metadata alone exceeds provider request limit run_id=%s request_bytes=%s metadata_budget_bytes=%s',b['runId'],request_bytes,effective_limit-512)
+            elif r.status_code==413 and request_limit>MIN_PLANNER_REQUEST_BYTES:
                 next_limit=max(MIN_PLANNER_REQUEST_BYTES,request_limit//2)
                 logger.warning('planner request rejected run_id=%s reason=provider_request_too_large request_bytes=%s reducing_limit_bytes=%s',b['runId'],request_bytes,next_limit)
                 request_limit=next_limit
