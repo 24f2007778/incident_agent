@@ -281,7 +281,9 @@ def build_initial(b,decision,traceparent=None,tracestate=None):
         if m and incoming_state:
             dispatch_item['tracestate']=incoming_state
         dispatch.append(dispatch_item)
-    state={'runId':b['runId'],'status':'waiting','diagnosis':{'rootCause':decision['rootCause'],'evidence':decision['evidence']},'chosenEffect':decision['effect'],'requiresApproval':decision['requiresApproval'],'dispatches':dispatch,'approvals':[],'actionLog':dispatch.copy(),'receiptLog':[],'pending':{x['callId']:{'dispatch':x,'logicalSpan':logical[i][3]} for i,x in enumerate(dispatch)},'toolResults':[],'trace':tr,'traceFlags':flags,'serverSpan':server,'agentSpan':agent,'spans':spans,'common':common,'traceparent':incoming if m else None,'tracestate':incoming_state if m else None,'requestHash':sha(b),'publicMarker':b['publicMarker'],'failed':False,'suppressed':[]}
+    join_id=span_id()
+    spans.append(span('incident.join',1,tr,join_id,agent,common,[item[3] for item in logical]))
+    state={'runId':b['runId'],'status':'waiting','diagnosis':{'rootCause':decision['rootCause'],'evidence':decision['evidence']},'chosenEffect':decision['effect'],'requiresApproval':decision['requiresApproval'],'dispatches':dispatch,'approvals':[],'actionLog':dispatch.copy(),'receiptLog':[],'pending':{x['callId']:{'dispatch':x,'logicalSpan':logical[i][3]} for i,x in enumerate(dispatch)},'toolResults':[],'trace':tr,'traceFlags':flags,'serverSpan':server,'agentSpan':agent,'joinSpan':join_id,'spans':spans,'common':common,'traceparent':incoming if m else None,'tracestate':incoming_state if m else None,'requestHash':sha(b),'publicMarker':b['publicMarker'],'failed':False,'suppressed':[]}
     if decision['requiresApproval']:
         aid='act-'+rid(8); approval={'approvalId':'approval-'+rid(8),'actionId':aid,'toolName':decision['effect']['toolName'],'argumentsDigest':sha(decision['effect']['arguments'])}
         state['pendingApproval']={'approval':approval,'arguments':decision['effect']['arguments'],'evidence':decision['effect']['evidence']}
@@ -290,10 +292,16 @@ def public_state(s):
     out={k:s[k] for k in ('runId','status','diagnosis') if k in s}
     if s.get('toolResults'):
         out['toolResults']=s['toolResults']
-    if s.get('status')=='waiting': out.update({'dispatches':s.get('dispatches',[]),'approvals':s.get('approvals',[])})
-    else:
-        out.update({'chosenEffect':s.get('chosenEffectName'),'suppressed':s.get('suppressed',[]),'actionLog':s.get('actionLog',[]),'receiptLog':s.get('receiptLog',[]),'otlp':{'resourceSpans':[{'scopeSpans':[{'spans':s.get('spans',[])}]}]}})
-        out['dispatches']=[]; out['approvals']=[]
+    waiting=s.get('status')=='waiting'
+    out.update({
+        'dispatches':s.get('dispatches',[]) if waiting else [],
+        'approvals':s.get('approvals',[]) if waiting else [],
+        'chosenEffect':s.get('chosenEffectName'),
+        'suppressed':s.get('suppressed',[]),
+        'actionLog':s.get('actionLog',[]),
+        'receiptLog':s.get('receiptLog',[]),
+        'otlp':{'resourceSpans':[{'scopeSpans':[{'spans':s.get('spans',[])}]}]}
+    })
     return out
 
 def save_state(c,run_id,state): c.execute('UPDATE runs SET state_json=? WHERE run_id=?',(canon(state),run_id))
@@ -451,12 +459,20 @@ async def receipt(run_id:str,request:Request):
             d=entry['dispatch']; logical_span=entry.get('logicalSpan')
             is_effect=d.get('phase')=='effect'
             effect_completed=effect_completed or (is_effect and o['status']==200)
-            s['toolResults'].append({
+            tool_result={
                 'actionId':o['actionId'],'callId':o['callId'],'attempt':o['attempt'],
                 'phase':d.get('phase'),'toolName':d['toolName'],'status':o['status'],
                 'resultClass':o.get('resultClass','')
-            })
+            }
+            if 'result' in o:
+                tool_result['result']=o['result']
+            s['toolResults'].append(tool_result)
             s['receiptLog'].append({'receiptId':b['receiptId'],'actionId':o['actionId'],'callId':o['callId'],'attempt':o['attempt'],'status':o['status'],'resultClass':o.get('resultClass',''),'nonce':o['nonce']})
+            logger.info(
+                'tool outcome recorded run_id=%s receipt_id=%s action_id=%s call_id=%s attempt=%s phase=%s tool_name=%s status=%s result_class=%s',
+                run_id,b['receiptId'],o['actionId'],o['callId'],o['attempt'],
+                d.get('phase'),d['toolName'],o['status'],o.get('resultClass','')
+            )
             client_span_id=d['traceparent'].split('-')[2]
             span_cli=next((x for x in s['spans'] if x['spanId']==client_span_id),None)
             if span_cli:
@@ -493,6 +509,10 @@ async def receipt(run_id:str,request:Request):
             pending=s['pendingApproval']
             if approvals:
                 a=approvals[0]; s['receiptLog'].append({'receiptId':b['receiptId'],'approvalId':a['approvalId'],'decision':a['decision'],'nonce':a['nonce']})
+                logger.info(
+                    'approval recorded run_id=%s receipt_id=%s approval_id=%s action_id=%s decision=%s',
+                    run_id,b['receiptId'],a['approvalId'],pending['approval']['actionId'],a['decision']
+                )
                 if a['decision']=='approved':
                     tool=pending['approval']['toolName']; aid=pending['approval']['actionId']; cid='call-'+rid(8); cli=span_id(); ex=span_id()
                     disp={'actionId':aid,'callId':cid,'phase':'effect','toolName':tool,'arguments':pending['arguments'],'evidence':pending['evidence'],'attempt':1,'approvalId':a['approvalId'],'approvalNonce':a['nonce'],'traceparent':f"00-{s['trace']}-{cli}-{s.get('traceFlags','01')}"}
@@ -518,8 +538,14 @@ async def receipt(run_id:str,request:Request):
             s['status']='waiting'
         if s['status'] in ('completed','failed'):
             s['dispatches']=[]; s['approvals']=[]; s['chosenEffectName']=s.get('chosenEffect',{}).get('toolName') if s['status']=='completed' else None
-            tool_span_ids=[item['spanId'] for item in s['spans'] if item['name'].startswith('execute_tool ')]
-            s['spans'].append(span('incident.join',1,s['trace'],span_id(),s['agentSpan'],s['common'],tool_span_ids))
+        tool_span_ids=[item['spanId'] for item in s['spans'] if item['name'].startswith('execute_tool ')]
+        join=next((item for item in s['spans'] if item['spanId']==s.get('joinSpan')),None)
+        if join is None:
+            join_id=span_id()
+            join=span('incident.join',1,s['trace'],join_id,s['agentSpan'],s['common'])
+            s['spans'].append(join)
+            s['joinSpan']=join_id
+        join['links']=[{'traceId':s['trace'],'spanId':tool_span_id,'attributes':[]} for tool_span_id in tool_span_ids]
         save_state(c,run_id,s)
         logger.info('receipt processed run_id=%s outcome_count=%s approval_count=%s status=%s dispatch_count=%s',run_id,len(outcomes),len(approvals),s['status'],len(s['dispatches']))
     return response(public_state(s))
