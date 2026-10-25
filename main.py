@@ -319,8 +319,8 @@ async def start(request:Request):
             if row['request_hash']!=rh:
                 logger.warning('incident request conflict run_id=%s reason=changed_content',run)
                 return response({'error':'runId reused with changed content'},409)
-            logger.info('incident request replay run_id=%s',run)
-            return response(public_state(json.loads(row['state_json'])))
+            logger.warning('incident request conflict run_id=%s reason=duplicate_run',run)
+            return response({'error':'runId already exists'},409)
     logger.info('incident planning started run_id=%s model=%s',run,MODEL)
     planning_started=time.monotonic()
     try:
@@ -352,8 +352,8 @@ async def start(request:Request):
             if row['request_hash']!=rh:
                 logger.warning('incident request conflict run_id=%s reason=changed_content',run)
                 return response({'error':'runId reused with changed content'},409)
-            logger.info('incident request replay after planning run_id=%s',run)
-            return response(public_state(json.loads(row['state_json'])))
+            logger.warning('incident request conflict run_id=%s reason=duplicate_run_after_planning',run)
+            return response({'error':'runId already exists'},409)
         c.execute('INSERT INTO runs(run_id,request_hash,state_json,created) VALUES(?,?,?,?)',(run,rh,canon(state),time.time()))
     logger.info('incident state persisted run_id=%s status=%s',run,state['status'])
     return response(public_state(state))
