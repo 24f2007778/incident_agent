@@ -32,10 +32,20 @@ def span(name,kind,trace,spanid,parent,attributes=None,links=None,status=0):
     if parent: x['parentSpanId']=parent
     if links: x['links']=[{'traceId':trace,'spanId':z,'attributes':[]} for z in links]
     return x
+def log_dispatch(run_id,dispatch):
+    logger.info(
+        'tool dispatch prepared run_id=%s action_id=%s call_id=%s attempt=%s phase=%s tool_name=%s approval_id=%s',
+        run_id,dispatch['actionId'],dispatch['callId'],dispatch['attempt'],
+        dispatch['phase'],dispatch['toolName'],dispatch.get('approvalId','')
+    )
 @contextmanager
 def db():
     c=sqlite3.connect(DB,timeout=20); c.row_factory=sqlite3.Row
-    try: yield c; c.commit()
+    try:
+        c.execute('PRAGMA synchronous=FULL')
+        c.execute('PRAGMA busy_timeout=20000')
+        yield c
+        c.commit()
     except: c.rollback(); raise
     finally: c.close()
 with db() as c:
@@ -52,9 +62,71 @@ def validate_start(b):
     inc=b.get('incident'); cat=b.get('toolCatalog'); pol=b.get('policy')
     if not isinstance(inc,dict) or not all(isinstance(inc.get(k),str) and inc[k] for k in ('incidentId','title','service','severity','transcript')): raise ValueError('invalid incident')
     if not isinstance(inc.get('allowedRootCauses'),list) or not inc['allowedRootCauses'] or any(not isinstance(x,str) for x in inc['allowedRootCauses']): raise ValueError('invalid allowedRootCauses')
-    if not isinstance(cat,list) or not all(isinstance(x,dict) and isinstance(x.get('name'),str) and isinstance(x.get('inputSchema'),dict) for x in cat): raise ValueError('invalid toolCatalog')
-    if not isinstance(pol,dict) or type(pol.get('maximumDiagnostics')) is not int or not isinstance(pol.get('effectTools'),list) or not isinstance(pol.get('approvalRequiredFor'),list): raise ValueError('invalid policy')
+    if (not isinstance(cat,list)
+            or not all(isinstance(x,dict) and isinstance(x.get('name'),str) and x['name'] and isinstance(x.get('inputSchema'),dict) for x in cat)
+            or len({x['name'] for x in cat})!=len(cat)): raise ValueError('invalid toolCatalog')
+    if (not isinstance(pol,dict) or type(pol.get('maximumDiagnostics')) is not int
+            or pol['maximumDiagnostics']<1 or not isinstance(pol.get('effectTools'),list)
+            or not all(isinstance(x,str) for x in pol['effectTools'])
+            or not isinstance(pol.get('approvalRequiredFor'),list)
+            or not all(isinstance(x,str) for x in pol['approvalRequiredFor'])): raise ValueError('invalid policy')
+    tool_names={tool['name'] for tool in cat}
+    if (not set(pol['effectTools'])<=tool_names
+            or not set(pol['approvalRequiredFor'])<=set(pol['effectTools'])):
+        raise ValueError('invalid effect tool policy')
     return b
+
+def validate_schema_value(value,schema):
+    if not isinstance(schema,dict):
+        raise ValueError('invalid tool input schema')
+    expected=schema.get('type')
+    expected_types=expected if isinstance(expected,list) else [expected] if expected else []
+    type_matches={
+        'object':lambda item:isinstance(item,dict),
+        'array':lambda item:isinstance(item,list),
+        'string':lambda item:isinstance(item,str),
+        'integer':lambda item:type(item) is int,
+        'number':lambda item:type(item) in (int,float),
+        'boolean':lambda item:type(item) is bool,
+        'null':lambda item:item is None,
+    }
+    if expected_types and not any(
+        kind in type_matches and type_matches[kind](value)
+        for kind in expected_types
+    ):
+        raise ValueError('argument type mismatch')
+    if 'const' in schema and value!=schema['const']:
+        raise ValueError('argument value mismatch')
+    if 'enum' in schema and value not in schema['enum']:
+        raise ValueError('argument value mismatch')
+    if isinstance(value,dict):
+        props=schema.get('properties',{})
+        if not isinstance(props,dict):
+            raise ValueError('invalid tool input schema')
+        if any(key not in value for key in schema.get('required',[])):
+            raise ValueError('arguments do not match tool schema')
+        additional=schema.get('additionalProperties',True)
+        for key,item in value.items():
+            if key in props:
+                validate_schema_value(item,props[key])
+            elif additional is False:
+                raise ValueError('arguments do not match tool schema')
+            elif isinstance(additional,dict):
+                validate_schema_value(item,additional)
+    if isinstance(value,list):
+        if len(value)<schema.get('minItems',0) or len(value)>schema.get('maxItems',float('inf')):
+            raise ValueError('argument length mismatch')
+        if isinstance(schema.get('items'),dict):
+            for item in value:
+                validate_schema_value(item,schema['items'])
+    if isinstance(value,str):
+        if len(value)<schema.get('minLength',0) or len(value)>schema.get('maxLength',float('inf')):
+            raise ValueError('argument length mismatch')
+        if 'pattern' in schema and not re.search(schema['pattern'],value):
+            raise ValueError('argument value mismatch')
+    if type(value) in (int,float):
+        if value<schema.get('minimum',float('-inf')) or value>schema.get('maximum',float('inf')):
+            raise ValueError('argument value mismatch')
 
 def evidence_ids(transcript): return re.findall(r'^\s*\[([A-Za-z0-9_.:-]+)\]',transcript,re.M)
 def normalize_evidence_id(value,valid_ids):
@@ -251,14 +323,7 @@ async def plan(b,trace,server_id,agent_id):
     if out.get('requiresApproval') != (eff['toolName'] in policy['approvalRequiredFor']): raise ValueError('approval flag mismatch')
     for x in [*ds,eff]:
         name=x['toolName']; schema=toolmap[name]['inputSchema']; args=x['arguments']
-        # Validate required and reject unexpected keys for common JSON Schema subset.
-        required=schema.get('required',[]); props=schema.get('properties',{})
-        if any(k not in args for k in required) or (schema.get('additionalProperties') is False and any(k not in props for k in args)): raise ValueError('arguments do not match tool schema')
-        for k,v in args.items():
-            typ=props.get(k,{}).get('type')
-            if typ=='string' and not isinstance(v,str): raise ValueError('argument type mismatch')
-            if typ=='integer' and type(v) is not int: raise ValueError('argument type mismatch')
-            if typ=='boolean' and type(v) is not bool: raise ValueError('argument type mismatch')
+        validate_schema_value(args,schema)
     return out
 
 def build_initial(b,decision,traceparent=None,tracestate=None):
@@ -275,12 +340,13 @@ def build_initial(b,decision,traceparent=None,tracestate=None):
     dispatch=[]; logical=[]; approvals=[]
     for d in decision['diagnostics']:
         aid='act-'+rid(8); cid='call-'+rid(8); ex=span_id(); cli=span_id(); logical.append((aid,cid,d['toolName'],ex,d['evidence']))
-        spans.append(span('execute_tool '+d['toolName'],1,tr,ex,agent,{**common,'ga5.action.id':aid,'gen_ai.tool.name':d['toolName'],'gen_ai.tool.call.id':cid,'gen_ai.operation.name':'execute_tool'}))
+        spans.append(span('execute_tool '+d['toolName'],1,tr,ex,agent,{**common,'ga5.action.id':aid,'gen_ai.tool.name':d['toolName'],'gen_ai.tool.call.id':cid,'ga5.attempt':1,'gen_ai.operation.name':'execute_tool'}))
         spans.append(span('POST tool/'+d['toolName'],3,tr,cli,ex,{**common,'ga5.action.id':aid,'gen_ai.tool.call.id':cid,'ga5.attempt':1,'http.request.method':'POST','http.request.resend_count':0}))
         dispatch_item={'actionId':aid,'callId':cid,'phase':'diagnostic','toolName':d['toolName'],'arguments':d['arguments'],'evidence':d['evidence'],'attempt':1,'traceparent':f'00-{tr}-{cli}-{flags}'}
         if m and incoming_state:
             dispatch_item['tracestate']=incoming_state
         dispatch.append(dispatch_item)
+        log_dispatch(b['runId'],dispatch_item)
     join_id=span_id()
     spans.append(span('incident.join',1,tr,join_id,agent,common,[item[3] for item in logical]))
     state={'runId':b['runId'],'status':'waiting','diagnosis':{'rootCause':decision['rootCause'],'evidence':decision['evidence']},'chosenEffect':decision['effect'],'requiresApproval':decision['requiresApproval'],'dispatches':dispatch,'approvals':[],'actionLog':dispatch.copy(),'receiptLog':[],'pending':{x['callId']:{'dispatch':x,'logicalSpan':logical[i][3]} for i,x in enumerate(dispatch)},'toolResults':[],'trace':tr,'traceFlags':flags,'serverSpan':server,'agentSpan':agent,'joinSpan':join_id,'spans':spans,'common':common,'traceparent':incoming if m else None,'tracestate':incoming_state if m else None,'requestHash':sha(b),'publicMarker':b['publicMarker'],'failed':False,'suppressed':[]}
@@ -395,6 +461,7 @@ async def receipt(run_id:str,request:Request):
         return response({'error':'invalid receipt request'},400)
     rh=sha(b)
     with db() as c:
+        c.execute('BEGIN IMMEDIATE')
         row=c.execute('SELECT state_json FROM runs WHERE run_id=?',(run_id,)).fetchone()
         if not row:return response({'error':'unknown run'},404)
         s=json.loads(row['state_json'])
@@ -427,7 +494,10 @@ async def receipt(run_id:str,request:Request):
             if o['actionId']!=d['actionId'] or o['attempt']!=d['attempt']:
                 logger.warning('receipt rejected run_id=%s reason=outcome_mismatch',run_id)
                 return response({'error':'outcome mismatch'},409)
-            if type(o['status']) is not int or not isinstance(o['nonce'],str) or not o['nonce']:
+            if (type(o['status']) is not int or not 0<=o['status']<=599
+                    or not isinstance(o['nonce'],str) or not o['nonce']
+                    or ('resultClass' in o and not isinstance(o['resultClass'],str))
+                    or ('errorType' in o and not isinstance(o['errorType'],str))):
                 logger.warning('receipt rejected run_id=%s reason=invalid_outcome_fields',run_id)
                 return response({'error':'invalid outcome fields'},400)
             seen.add(key)
@@ -453,7 +523,7 @@ async def receipt(run_id:str,request:Request):
             logger.warning('receipt rejected run_id=%s reason=empty_receipt',run_id)
             return response({'error':'empty receipt'},400)
         c.execute('INSERT INTO receipt_ids(receipt_id,run_id,receipt_hash) VALUES(?,?,?)',(b['receiptId'],run_id,rh))
-        next_dispatch=[]; effect_completed=False
+        effect_completed=False
         for o in outcomes:
             entry=s['pending'].pop(o['callId'])
             d=entry['dispatch']; logical_span=entry.get('logicalSpan')
@@ -475,8 +545,11 @@ async def receipt(run_id:str,request:Request):
             )
             client_span_id=d['traceparent'].split('-')[2]
             span_cli=next((x for x in s['spans'] if x['spanId']==client_span_id),None)
+            logical_tool_span=next((x for x in s['spans'] if x['spanId']==logical_span),None)
+            if logical_tool_span:
+                logical_tool_span['status']={'code':0 if o['status']==200 else 2}
             if span_cli:
-                span_cli['attributes'] += attrs({'ga5.receipt.id':b['receiptId'],'ga5.receipt.nonce':o['nonce'],'http.response.status_code':o['status']})
+                span_cli['attributes'] += attrs({'ga5.receipt.id':b['receiptId'],'ga5.receipt.nonce':o['nonce'],'http.response.status_code':o['status'],'gen_ai.response.result_class':o.get('resultClass','')})
                 if o['status']==503 or (o['status']==0 and o.get('errorType')=='timeout'):
                     span_cli['status']={'code':2}
                     error_type='timeout' if o['status']==0 else '503'
@@ -488,14 +561,22 @@ async def receipt(run_id:str,request:Request):
                 cli=span_id(); new=dict(d); new['attempt']=2; new['traceparent']=f"00-{s['trace']}-{cli}-{s.get('traceFlags','01')}"
                 if s.get('tracestate'):
                     new['tracestate']=s['tracestate']
-                next_dispatch.append(new); s['pending'][new['callId']]={'dispatch':new,'logicalSpan':logical_span}
+                s['pending'][new['callId']]={'dispatch':new,'logicalSpan':logical_span}
                 s['actionLog'].append(new)
+                log_dispatch(run_id,new)
                 s['spans'].append(span('POST tool/'+d['toolName'],3,s['trace'],cli,logical_span,{**s['common'],'ga5.action.id':d['actionId'],'gen_ai.tool.call.id':d['callId'],'ga5.attempt':2,'http.request.method':'POST','http.request.resend_count':1}))
             elif o['status']!=200:
                 s['failed']=True
                 if not is_effect:
                     s['suppressed']=['dependent_effect_not_dispatched']
-        s['dispatches']=next_dispatch; s['approvals']=[]
+        pending_order={dispatch['callId']:index for index,dispatch in enumerate(s['actionLog'])}
+        s['dispatches']=[
+            entry['dispatch'] for call_id,entry in sorted(
+                s['pending'].items(),
+                key=lambda item:pending_order.get(item[0],len(pending_order))
+            )
+        ]
+        s['approvals']=[]
         if s['pending']:
             s['status']='waiting'
         elif s['failed']:
@@ -519,21 +600,28 @@ async def receipt(run_id:str,request:Request):
                     if s.get('tracestate'):
                         disp['tracestate']=s['tracestate']
                     s['dispatches']=[disp]; s['actionLog'].append(disp); s['pending'][cid]={'dispatch':disp,'logicalSpan':ex}
+                    log_dispatch(run_id,disp)
                     gate=span_id()
                     s['spans'].append(span('approval_gate',1,s['trace'],gate,s['agentSpan'],{**s['common'],'ga5.action.id':aid,'ga5.approval.id':a['approvalId'],'ga5.approval.receipt.nonce':a['nonce']}))
-                    s['spans'].append(span('execute_tool '+tool,1,s['trace'],ex,gate,{**s['common'],'ga5.action.id':aid,'gen_ai.tool.name':tool,'gen_ai.tool.call.id':cid,'gen_ai.operation.name':'execute_tool','ga5.approval.id':a['approvalId']}))
+                    s['spans'].append(span('execute_tool '+tool,1,s['trace'],ex,gate,{**s['common'],'ga5.action.id':aid,'gen_ai.tool.name':tool,'gen_ai.tool.call.id':cid,'ga5.attempt':1,'gen_ai.operation.name':'execute_tool','ga5.approval.id':a['approvalId']}))
                     s['spans'].append(span('POST tool/'+tool,3,s['trace'],cli,ex,{**s['common'],'ga5.action.id':aid,'gen_ai.tool.call.id':cid,'ga5.attempt':1,'ga5.approval.id':a['approvalId'],'http.request.method':'POST','http.request.resend_count':0}))
                     s['pendingApproval']=None
                 else: s['status']='completed'; s['chosenEffectName']=None; s['pendingApproval']=None
             else:
                 s['status']='waiting'; s['approvals']=[pending['approval']]
+                logger.info(
+                    'approval offered run_id=%s approval_id=%s action_id=%s tool_name=%s',
+                    run_id,pending['approval']['approvalId'],pending['approval']['actionId'],
+                    pending['approval']['toolName']
+                )
         else:
             effect=s['chosenEffect']; tool=effect['toolName']; aid='act-'+rid(8); cid='call-'+rid(8); ex=span_id(); cli=span_id()
             disp={'actionId':aid,'callId':cid,'phase':'effect','toolName':tool,'arguments':effect['arguments'],'evidence':effect.get('evidence',s['diagnosis']['evidence'][:1]),'attempt':1,'traceparent':f"00-{s['trace']}-{cli}-{s.get('traceFlags','01')}"}
             if s.get('tracestate'):
                 disp['tracestate']=s['tracestate']
             s['dispatches']=[disp]; s['actionLog'].append(disp); s['pending'][cid]={'dispatch':disp,'logicalSpan':ex}
-            s['spans'].append(span('execute_tool '+tool,1,s['trace'],ex,s['agentSpan'],{**s['common'],'ga5.action.id':aid,'gen_ai.tool.name':tool,'gen_ai.tool.call.id':cid,'gen_ai.operation.name':'execute_tool'}))
+            log_dispatch(run_id,disp)
+            s['spans'].append(span('execute_tool '+tool,1,s['trace'],ex,s['agentSpan'],{**s['common'],'ga5.action.id':aid,'gen_ai.tool.name':tool,'gen_ai.tool.call.id':cid,'ga5.attempt':1,'gen_ai.operation.name':'execute_tool'}))
             s['spans'].append(span('POST tool/'+tool,3,s['trace'],cli,ex,{**s['common'],'ga5.action.id':aid,'gen_ai.tool.call.id':cid,'ga5.attempt':1,'http.request.method':'POST','http.request.resend_count':0}))
             s['status']='waiting'
         if s['status'] in ('completed','failed'):
